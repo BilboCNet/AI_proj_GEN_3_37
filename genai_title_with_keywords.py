@@ -2,33 +2,35 @@
 genai_title_with_keywords.py
 ============================
 
-Скрипт для автоматического создания заголовка с обязательным включением
-ключевых слов, извлечённых из заданного текста.
+Скрипт для генерации описания для слайда презентации с обязательным
+включением ключевых слов.
 
 Алгоритм работы:
-1. Читает исходный текст из файла.
+1. Получает тему слайда из файла.
 2. Извлекает ключевые слова с помощью YAKE.
-3. Формирует промпт для модели суммаризации mT5.
-4. Генерирует краткий заголовок, который включает извлечённые ключевые слова.
-5. Проверяет, все ли ключевые слова использованы, и при необходимости
-   добавляет недостающие.
+3. Формирует промпт для модели mT5.
+4. Генерирует краткое описание (около 30 слов), включая ключевые слова.
+5. Проверяет длину и наличие ключевых слов.
+6. Сохраняет результат в CSV-файл.
+7. Выводит результат в виде таблицы.
 
 Запуск:
-    python genai_title_with_keywords.py --infile input.txt --lang ru --num_keywords 5
+    python genai_title_with_keywords.py --infile input.txt --outfile result.csv
 """
 
 import argparse
 import re
 from pathlib import Path
+import pandas as pd
 import yake
 from transformers import pipeline
 
 # ---------------------------------------------------------------------
-# Конфигурация по умолчанию для модели и генерации заголовка
+# Конфигурация по умолчанию для модели и генерации описания
 # ---------------------------------------------------------------------
 DEFAULT_SUMM_MODEL = "csebuetnlp/mT5_multilingual_XLSum"
-DEFAULT_MAX_LEN = 32
-DEFAULT_MIN_LEN = 6
+DEFAULT_MAX_LEN = 60
+DEFAULT_MIN_LEN = 20
 REPEAT_TRIES = 3
 
 
@@ -63,75 +65,68 @@ def keywords(text: str, lang: str = "ru", keywords_num: int = 6):
     return cleaned
 
 
-def build_prompt(keywords, lang: str = "ru"):
+def build_prompt(topic: str, keywords: list[str], lang: str = "ru"):
     """
-    Формирует инструкцию (промпт) для модели суммаризации.
-    Усилено: запрет на скобки и «списки в конце».
+    Формирует инструкцию (промпт) для модели.
     """
     kw_str = ", ".join(keywords)
     if lang.startswith("ru"):
         return (
-            f"Создай заголовок, включив слова: {kw_str}. "
-            f"Верни только один короткий заголовок (6–12 слов), без кавычек. "
-            f"Не используй никакие скобки ((), [], {{}}) и не выводи перечисление слов в конце; "
-            f"встрой слова органично в саму фразу."
+            f"Сгенерируй краткое описание для слайда на тему '{topic}', "
+            f"включив в него ключевые слова: {kw_str}. "
+            f"Описание должно быть длиной около 30 слов. "
+            f"Не используй скобки и кавычки."
         )
     else:
         return (
-            f"Create a headline that includes the words: {kw_str}. "
-            f"Return only one short headline (6–12 words), no quotes. "
-            f"Do not use any brackets and do not append a list of words at the end; "
-            f"integrate the words naturally into the sentence."
+            f"Generate a short description for a slide on the topic '{topic}', "
+            f"including the keywords: {kw_str}. "
+            f"The description should be about 30 words long. "
+            f"Do not use brackets or quotes."
         )
 
 
-def summarize_title(body_text: str,
-                    prompt: str,
-                    model_name: str = DEFAULT_SUMM_MODEL,
-                    min_len: int = DEFAULT_MIN_LEN,
-                    max_len: int = DEFAULT_MAX_LEN) -> str:
+def generate_description(prompt: str,
+                         model_name: str = DEFAULT_SUMM_MODEL,
+                         min_len: int = DEFAULT_MIN_LEN,
+                         max_len: int = DEFAULT_MAX_LEN) -> str:
     """
-    Генерирует заголовок на основе исходного текста и промпта.
+    Генерирует описание на основе промпта.
     """
     summarizer = pipeline("summarization", model=model_name)
-    inp = f"{prompt}\n\nтекст: {body_text}"
     out = summarizer(
-        inp,
+        prompt,
         max_length=max_len,
         min_length=min_len,
         do_sample=False,
         truncation=True,
     )
-    title = out[0]["summary_text"]
-    title = postprocess_title(title)
-    return title
+    description = out[0]["summary_text"]
+    description = postprocess_text(description)
+    return description
 
 
-def postprocess_title(title: str) -> str:
+def postprocess_text(text: str) -> str:
     """
-    Лёгкий санитайзер заголовка:
+    Лёгкий санитайзер текста:
     - обрезает пробелы/кавычки,
     - схлопывает множественные пробелы,
     - удаляет финальные списки в скобках: (...), [...], {...}.
     """
-    t = title.strip().strip("«»\"'“”")
+    t = text.strip().strip("«»\"'“”")
     t = re.sub(r"\s+", " ", t)
-
-    # удалить любые хвостовые скобочные вставки
     t = re.sub(r"\s*[\(\[\{][^)\]\}]{0,200}[\)\]\}]\s*$", "", t).strip()
-
-    # убрать лишние: «— ,» и двойные знаки
     t = re.sub(r"\s+—\s*,", " —", t)
     t = re.sub(r"\s+,", ",", t)
     t = re.sub(r",\s*,", ", ", t)
     return t
 
 
-def coverage_score(title: str, keywords: list[str]):
+def coverage_score(text: str, keywords: list[str]):
     """
-    Оценивает покрытие ключевых слов (строгое вхождение по подстроке).
+    Оценивает покрытие ключевых слов.
     """
-    t = " " + title.lower() + " "
+    t = " " + text.lower() + " "
     missed = []
     hit = 0
     for kw in keywords:
@@ -144,135 +139,111 @@ def coverage_score(title: str, keywords: list[str]):
     return cov, missed
 
 
-def compose_from_keywords_inline(keywords: list[str], lang: str = "ru") -> str:
+def compose_from_keywords(keywords: list[str], topic: str = "", lang: str = "ru") -> str:
     """
-    Собирает простой читабельный заголовок из самих ключей,
-    без скобок. Гарантирует вхождение всех ключевых слов.
+    Собирает описание из ключевых слов, если модель не справилась.
     """
     if not keywords:
         return ""
 
-    k = [x.strip() for x in keywords if x.strip()]
-    first = k[0].capitalize()
-    tail = k[1:]
-
+    kw_str = ", ".join(keywords)
     if lang.startswith("ru"):
-        if len(tail) >= 3:
-            # это не грамматически идеальный генератор, но гарантирует отсутствие скобок
-            core = []
-            # первые два как определение + существительное
-            core.append(" ".join(tail[0:2]))
-            # остальное склеим через запятую, иногда добавив предлог
-            rest = []
-            for i, tok in enumerate(tail[2:]):
-                if i == 0 and not re.search(r"\bв\b|\bдля\b|\bна\b", tok):
-                    rest.append(f"в {tok}")
-                else:
-                    rest.append(tok)
-            phrase = ", ".join([c for c in [core[0]] + rest if c])
-            return f"{first} — {phrase}".strip(" —,")
-        else:
-            return f"{first} — {', '.join(tail)}".strip(" —,")
+        return f"Краткое описание для слайда на тему '{topic}': {kw_str}."
     else:
-        # generic EN-ish joiner
-        return f"{first} — {', '.join(tail)}".strip(" —,")
+        return f"A short description for the slide on '{topic}': {kw_str}."
 
 
-def integrate_missing_inline(title: str, missed: list[str], all_keywords: list[str], lang: str = "ru") -> str:
+def integrate_missing(description: str, missed: list[str], all_keywords: list[str], topic: str, lang: str = "ru") -> str:
     """
-    Если модель что-то не включила, стратегия:
-    1) Если заголовок пустой/слишком общий или содержит скобки — полностью
-       пересобрать из ключей через compose_from_keywords_inline().
-    2) Иначе — добавить через « — »/«: » компактной фразой без скобок.
+    Если модель что-то не включила, добавляем недостающие слова.
     """
-    t = title.strip()
-    if not t or re.search(r"[\(\[\{][^)\]\}]{0,200}[\)\]\}]\s*$", t):
-        return compose_from_keywords_inline(all_keywords, lang=lang)
+    d = description.strip()
+    if not d or len(d.split()) < 10:
+        return compose_from_keywords(all_keywords, topic=topic, lang=lang)
 
     if not missed:
-        # ничего не потеряно — вернём санитайзнутый вариант
-        return postprocess_title(t)
+        return postprocess_text(d)
 
     add = ", ".join(missed)
-    # Если уже есть двоеточие/тире — добавим после запятой
-    if " — " in t or ":" in t:
-        return postprocess_title(f"{t}, {add}")
-    # Иначе добавим через « — »
-    return postprocess_title(f"{t} — {add}")
+    return postprocess_text(f"{d}. Дополнительные ключевые слова: {add}")
+
+
+def save_to_csv(slide_title: str, content: str, outfile: Path):
+    """
+    Сохраняет данные в CSV-файл.
+    """
+    df = pd.DataFrame([[slide_title, content]], columns=["slide_title", "content"])
+    df.to_csv(outfile, index=False, encoding="utf-8")
+
+
+def display_table(outfile: Path):
+    """
+    Выводит содержимое CSV-файла в виде таблицы.
+    """
+    try:
+        df = pd.read_csv(outfile)
+        print("\n" + df.to_string(index=False))
+    except FileNotFoundError:
+        print(f"Ошибка: файл {outfile} не найден.")
 
 
 def main():
     """
-    Точка входа CLI:
-    * парсит аргументы командной строки,
-    * извлекает ключевые слова,
-    * генерирует заголовок с включением этих слов,
-    * выводит метрики покрытия.
+    Точка входа CLI.
     """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--infile", type=str, required=True, help="Путь к исходному тексту")
+    ap.add_argument("--infile", type=str, required=True, help="Путь к файлу с темой слайда")
+    ap.add_argument("--outfile", type=str, default="slide_description.csv", help="Путь к CSV файлу для сохранения результата")
     ap.add_argument("--lang", type=str, default="ru", help="Язык для извлечения ключевых слов (yake)")
-    ap.add_argument("--num_keywords", type=int, default=6, help="Сколько ключевых слов извлекать")
+    ap.add_argument("--num_keywords", type=int, default=5, help="Сколько ключевых слов извлекать")
     ap.add_argument("--model", type=str, default=DEFAULT_SUMM_MODEL, help="HF-модель для summarization")
     ap.add_argument("--min_coverage", type=float, default=0.8, help="Порог метрики покрытия ключевых слов")
-    ap.add_argument("--max_len", type=int, default=DEFAULT_MAX_LEN, help="Макс длина заголовка (токены)")
-    ap.add_argument("--min_len", type=int, default=DEFAULT_MIN_LEN, help="Мин длина заголовка (токены)")
+    ap.add_argument("--max_len", type=int, default=DEFAULT_MAX_LEN, help="Макс длина описания (токены)")
+    ap.add_argument("--min_len", type=int, default=DEFAULT_MIN_LEN, help="Мин длина описания (токены)")
     args = ap.parse_args()
 
-    text = read_text(Path(args.infile))
-    keywords_list = keywords(text, lang=args.lang, keywords_num=args.num_keywords)
+    topic = read_text(Path(args.infile))
+    keywords_list = keywords(topic, lang=args.lang, keywords_num=args.num_keywords)
     if not keywords_list:
         raise SystemExit("Не удалось извлечь ключевые слова — проверьте входной текст.")
 
-    base_prompt = build_prompt(keywords_list, lang=args.lang)
+    base_prompt = build_prompt(topic, keywords_list, lang=args.lang)
 
-    title = ""
+    description = ""
     missed = keywords_list[:]
     cov = 0.0
 
     for attempt in range(1, REPEAT_TRIES + 1):
-        # Первая/очередная генерация
-        title = summarize_title(
-            body_text=text,
-            prompt=base_prompt if attempt == 1 else (
-                build_prompt(keywords_list, lang=args.lang)
-                + " Используй каждое слово дословно. Не используй скобки и не ставь все слова в конец."
-            ),
+        prompt = base_prompt
+        if attempt > 1:
+            prompt += " Используй все ключевые слова."
+
+        description = generate_description(
+            prompt=prompt,
             model_name=args.model,
             min_len=args.min_len,
             max_len=args.max_len,
         )
-        cov, missed = coverage_score(title, keywords_list)
+        cov, missed = coverage_score(description, keywords_list)
 
-        # если модель всё-таки вывела скобки — вычистим и проверим ещё раз
-        cleaned = postprocess_title(title)
-        if cleaned != title:
-            title = cleaned
-            cov, missed = coverage_score(title, keywords_list)
+        cleaned = postprocess_text(description)
+        if cleaned != description:
+            description = cleaned
+            cov, missed = coverage_score(description, keywords_list)
 
-        if cov >= args.min_coverage and not re.search(r"[\(\[\{].*[\)\]\}]$", title):
+        if cov >= args.min_coverage:
             break
 
-    # Если всё ещё ниже порога — встроим недостающие слова
-    if cov < args.min_coverage or re.search(r"[\(\[\{].*[\)\]\}]$", title):
-        title = integrate_missing_inline(title, missed, keywords_list, lang=args.lang)
-        cov, missed = coverage_score(title, keywords_list)
+    if cov < args.min_coverage:
+        description = integrate_missing(description, missed, keywords_list, topic, lang=args.lang)
+        cov, missed = coverage_score(description, keywords_list)
 
-    # ====== Вывод ======
-    print("\n=== ключевые слова ===")
-    print(", ".join(keywords_list))
-    print("\n=== промпт ===")
-    print(base_prompt)
-    print("\n=== заголовок ===")
-    print(title)
-    print("\n=== метрика ===")
-    used = len(keywords_list) - len(missed)
-    total = len(keywords_list)
-    print(f"покрытие ключевых слов: {used}/{total} = {used / total:.0%}")
-    if missed:
-        print("не использованы:", ", ".join(missed))
-    else:
-        print("все ключевыые слова учтены.")
+    # ====== Сохранение и вывод ======
+    outfile = Path(args.outfile)
+    save_to_csv(topic, description, outfile)
+
+    print(f"\nРезультат сохранён в: {outfile}")
+    display_table(outfile)
 
 
 if __name__ == "__main__":
