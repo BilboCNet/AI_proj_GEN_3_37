@@ -1,0 +1,6 @@
+transformers 
+torch 
+sentencepiece 
+safetensors 
+accelerate 
+yake
