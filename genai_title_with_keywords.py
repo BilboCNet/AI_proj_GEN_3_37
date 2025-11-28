@@ -1,279 +1,266 @@
 """
-genai_title_with_keywords.py
-============================
-
-Скрипт для автоматического создания заголовка с обязательным включением
-ключевых слов, извлечённых из заданного текста.
-
-Алгоритм работы:
-1. Читает исходный текст из файла.
-2. Извлекает ключевые слова с помощью YAKE.
-3. Формирует промпт для модели суммаризации mT5.
-4. Генерирует краткий заголовок, который включает извлечённые ключевые слова.
-5. Проверяет, все ли ключевые слова использованы, и при необходимости
-   добавляет недостающие.
-
-Запуск:
-    python genai_title_with_keywords.py --infile input.txt --lang ru --num_keywords 5
+genai_batch_titles.py
+=====================
+Скрипт для пакетной обработки тем слайдов с итеративным сокращением текста до 30 слов.
 """
 
 import argparse
 import re
 from pathlib import Path
+import pandas as pd
 import yake
-from transformers import pipeline
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# ---------------------------------------------------------------------
-# Конфигурация по умолчанию для модели и генерации заголовка
-# ---------------------------------------------------------------------
-DEFAULT_SUMM_MODEL = "csebuetnlp/mT5_multilingual_XLSum"
-DEFAULT_MAX_LEN = 32
-DEFAULT_MIN_LEN = 6
+# Конфигурация
+DEFAULT_MODEL = "Qwen/Qwen2.5-7B-Instruct-1M"
+DEFAULT_MAX_LEN = 128
 REPEAT_TRIES = 3
+MAX_WORDS_LIMIT = 30 
 
+def read_topics(path: Path) -> list[str]:
+    """Читает файл построчно."""
+    if not path.exists():
+        return []
+    content = path.read_text(encoding="utf-8")
+    lines = content.split('\n')
+    topics = [line.strip() for line in lines if line.strip()]
+    return topics
 
-def read_text(path: Path) -> str:
-    """
-    Читает текст из файла и приводит его к «чистому» виду.
-    """
-    text = path.read_text(encoding="utf_8")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def keywords(text: str, lang: str = "ru", keywords_num: int = 6):
-    """
-    Извлекает ключевые слова из текста с помощью YAKE.
-    Возвращает список уникальных токенов.
-    """
-    kw_extractor = yake.KeywordExtractor(lan=lang, n=1, dedupLim=0.9, top=keywords_num * 3)
+def extract_keywords_from_title(text: str, lang: str = "ru", keywords_num: int = 3) -> list[str]:
+    """Извлекает ключевые слова из заголовка."""
+    kw_extractor = yake.KeywordExtractor(lan=lang, n=1, dedupLim=0.9, top=10, windowsSize=1)
     candidates = kw_extractor.extract_keywords(text)
+    
     cleaned = []
     seen = set()
-    for kw, _ in sorted(candidates, key=lambda x: x[1]):
+    sorted_candidates = sorted(candidates, key=lambda x: x[1])
+    
+    for kw, _ in sorted_candidates:
         token = kw.strip().lower()
         token = re.sub(r"[^0-9A-Za-zА-Яа-яёЁ\- ]+", "", token)
-        token = re.sub(r"\s+", " ", token).strip(" -")
-        if not token or token in seen or len(token) < 2:
+        if not token or token in seen or len(token) < 3:
             continue
         seen.add(token)
         cleaned.append(token)
         if len(cleaned) >= keywords_num:
             break
+            
+    if not cleaned:
+        words = re.findall(r"\w+", text)
+        cleaned = [w.lower() for w in words if len(w) > 4][:keywords_num]
+        
     return cleaned
 
-
-def build_prompt(keywords, lang: str = "ru"):
+def build_prompt(topic: str, keywords: list[str], lang: str = "ru") -> list[dict]:
     """
-    Формирует инструкцию (промпт) для модели суммаризации.
-    Усилено: запрет на скобки и «списки в конце».
+    Формирует промпт с жестким требованием к языку и длине.
     """
     kw_str = ", ".join(keywords)
+    
     if lang.startswith("ru"):
-        return (
-            f"Создай заголовок, включив слова: {kw_str}. "
-            f"Верни только один короткий заголовок (6–12 слов), без кавычек. "
-            f"Не используй никакие скобки ((), [], {{}}) и не выводи перечисление слов в конце; "
-            f"встрой слова органично в саму фразу."
+        system_prompt = "Ты — эксперт по созданию презентаций и копирайтингу. Ты пишешь ТОЛЬКО на русском языке."
+        user_prompt = (
+            f"ЗАДАЧА:\n"
+            f"Напиши информативное описание для этого слайда. "
+            f"ВНИМАНИЕ: Используй ТОЛЬКО чистый русский язык. Исключи любые английские или другие иностранные слова, всегда используй их русские эквиваленты."
+            f"Объем: ЧУТЬ МЕНЬШЕ {MAX_WORDS_LIMIT} слов.\n"
+            f"ОБЯЗАТЕЛЬНО включи в текст эти ключевые слова: {kw_str}.\n"
+            f"Не повторяй заголовок слово в слово. Раскрой суть темы.\n"
+            f"Тема слайда: \"{topic}\"\n\n"
         )
     else:
-        return (
-            f"Create a headline that includes the words: {kw_str}. "
-            f"Return only one short headline (6–12 words), no quotes. "
-            f"Do not use any brackets and do not append a list of words at the end; "
-            f"integrate the words naturally into the sentence."
+        system_prompt = "You are an expert in presentation design and copywriting."
+        user_prompt = (
+            f"TASK:\n"
+            f"Write an informative description for this slide. "
+            f"Length: strictly no more than {MAX_WORDS_LIMIT} words.\n"
+            f"You MUST include these keywords: {kw_str}.\n"
+            f"Do not just repeat the title. Expand on the core idea."
+            f"Slide Topic: \"{topic}\"\n\n"
         )
 
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
 
-def summarize_title(body_text: str,
-                    prompt: str,
-                    model_name: str = DEFAULT_SUMM_MODEL,
-                    min_len: int = DEFAULT_MIN_LEN,
-                    max_len: int = DEFAULT_MAX_LEN) -> str:
-    """
-    Генерирует заголовок на основе исходного текста и промпта.
-    """
-    summarizer = pipeline("summarization", model=model_name)
-    inp = f"{prompt}\n\nтекст: {body_text}"
-    out = summarizer(
-        inp,
-        max_length=max_len,
-        min_length=min_len,
-        do_sample=False,
-        truncation=True,
+def generate_description(model, tokenizer, messages: list[dict], max_len: int = DEFAULT_MAX_LEN) -> str:
+    """Генерирует текст."""
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
     )
-    title = out[0]["summary_text"]
-    title = postprocess_title(title)
-    return title
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
+    generated_ids = model.generate(
+        **model_inputs,
+        max_new_tokens=max_len,
+        do_sample=True,
+        temperature=0.5,
+        repetition_penalty=1.1
+    )
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
 
-def postprocess_title(title: str) -> str:
-    """
-    Лёгкий санитайзер заголовка:
-    - обрезает пробелы/кавычки,
-    - схлопывает множественные пробелы,
-    - удаляет финальные списки в скобках: (...), [...], {...}.
-    """
-    t = title.strip().strip("«»\"'“”")
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return postprocess_text(response)
+
+def postprocess_text(text: str) -> str:
+    """Чистка текста от лишних символов и фраз модели."""
+    t = text.strip().strip("«»\"'“”")
     t = re.sub(r"\s+", " ", t)
-
-    # удалить любые хвостовые скобочные вставки
-    t = re.sub(r"\s*[\(\[\{][^)\]\}]{0,200}[\)\]\}]\s*$", "", t).strip()
-
-    # убрать лишние: «— ,» и двойные знаки
-    t = re.sub(r"\s+—\s*,", " —", t)
-    t = re.sub(r"\s+,", ",", t)
-    t = re.sub(r",\s*,", ", ", t)
+    t = re.sub(r"^(Конечно|Вот описание|Описание слайда|Суть слайда)[:\.]?\s*", "", t, flags=re.IGNORECASE)
     return t
 
-
-def coverage_score(title: str, keywords: list[str]):
-    """
-    Оценивает покрытие ключевых слов (строгое вхождение по подстроке).
-    """
-    t = " " + title.lower() + " "
+def coverage_score(text: str, keywords: list[str]):
+    """Проверяет наличие ключевых слов."""
+    t = " " + text.lower() + " "
     missed = []
     hit = 0
     for kw in keywords:
         kw_l = kw.lower()
-        if f" {kw_l} " in t or kw_l in t:
+        if kw_l in t: 
             hit += 1
         else:
             missed.append(kw)
     cov = 0.0 if not keywords else hit / len(keywords)
     return cov, missed
 
-
-def compose_from_keywords_inline(keywords: list[str], lang: str = "ru") -> str:
+def enforce_length_limit(model, tokenizer, original_text: str, limit: int, attempt_limit: int = 3) -> str:
     """
-    Собирает простой читабельный заголовок из самих ключей,
-    без скобок. Гарантирует вхождение всех ключевых слов.
+    Принудительно сокращает текст, используя модель (итеративное переписывание).
     """
-    if not keywords:
-        return ""
+    
+    length_messages = [
+        {"role": "system", "content": "Ты — профессиональный редактор. Твоя единственная задача — сократить текст до требуемой длины, сохраняя его смысл и тон."},
+        {"role": "user", "content": f"Сократи следующий текст СТРОГО до {limit} слов. Текст: \"{original_text}\""}
+    ]
+    
+    current_desc = original_text
+    
+    for attempt in range(1, attempt_limit + 1):
+        word_count = len(current_desc.split())
+        
+        if word_count <= limit:
+            return current_desc 
+        
+        if attempt > 1:
+            print(f"    -> Попытка {attempt}: Повторное сокращение (Текущая длина: {word_count} слов)...")
+            length_messages.append({"role": "assistant", "content": current_desc})
+            length_messages.append({"role": "user", "content": f"Ты не справился с задачей. Повтори сокращение СТРОЖЕ. Текст должен быть НЕ БОЛЕЕ {limit} слов. Сохрани оригинальный смысл."})
 
-    k = [x.strip() for x in keywords if x.strip()]
-    first = k[0].capitalize()
-    tail = k[1:]
+        current_desc = generate_description(model, tokenizer, length_messages)
 
-    if lang.startswith("ru"):
-        if len(tail) >= 3:
-            # это не грамматически идеальный генератор, но гарантирует отсутствие скобок
-            core = []
-            # первые два как определение + существительное
-            core.append(" ".join(tail[0:2]))
-            # остальное склеим через запятую, иногда добавив предлог
-            rest = []
-            for i, tok in enumerate(tail[2:]):
-                if i == 0 and not re.search(r"\bв\b|\bдля\b|\bна\b", tok):
-                    rest.append(f"в {tok}")
-                else:
-                    rest.append(tok)
-            phrase = ", ".join([c for c in [core[0]] + rest if c])
-            return f"{first} — {phrase}".strip(" —,")
-        else:
-            return f"{first} — {', '.join(tail)}".strip(" —,")
-    else:
-        # generic EN-ish joiner
-        return f"{first} — {', '.join(tail)}".strip(" —,")
+        word_count = len(current_desc.split())
+        
+        if word_count <= limit:
+            return current_desc 
 
-
-def integrate_missing_inline(title: str, missed: list[str], all_keywords: list[str], lang: str = "ru") -> str:
-    """
-    Если модель что-то не включила, стратегия:
-    1) Если заголовок пустой/слишком общий или содержит скобки — полностью
-       пересобрать из ключей через compose_from_keywords_inline().
-    2) Иначе — добавить через « — »/«: » компактной фразой без скобок.
-    """
-    t = title.strip()
-    if not t or re.search(r"[\(\[\{][^)\]\}]{0,200}[\)\]\}]\s*$", t):
-        return compose_from_keywords_inline(all_keywords, lang=lang)
-
-    if not missed:
-        # ничего не потеряно — вернём санитайзнутый вариант
-        return postprocess_title(t)
-
-    add = ", ".join(missed)
-    # Если уже есть двоеточие/тире — добавим после запятой
-    if " — " in t or ":" in t:
-        return postprocess_title(f"{t}, {add}")
-    # Иначе добавим через « — »
-    return postprocess_title(f"{t} — {add}")
-
+    print(f"    -> Превышено число попыток сокращения. Финальная длина: {word_count} слов.")
+    return current_desc
 
 def main():
-    """
-    Точка входа CLI:
-    * парсит аргументы командной строки,
-    * извлекает ключевые слова,
-    * генерирует заголовок с включением этих слов,
-    * выводит метрики покрытия.
-    """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--infile", type=str, required=True, help="Путь к исходному тексту")
-    ap.add_argument("--lang", type=str, default="ru", help="Язык для извлечения ключевых слов (yake)")
-    ap.add_argument("--num_keywords", type=int, default=6, help="Сколько ключевых слов извлекать")
-    ap.add_argument("--model", type=str, default=DEFAULT_SUMM_MODEL, help="HF-модель для summarization")
-    ap.add_argument("--min_coverage", type=float, default=0.8, help="Порог метрики покрытия ключевых слов")
-    ap.add_argument("--max_len", type=int, default=DEFAULT_MAX_LEN, help="Макс длина заголовка (токены)")
-    ap.add_argument("--min_len", type=int, default=DEFAULT_MIN_LEN, help="Мин длина заголовка (токены)")
+    ap.add_argument("--infile", type=str, required=True, help="Путь к файлу со списком тем")
+    ap.add_argument("--outfile", type=str, default="slides_output.csv", help="Файл результата")
+    ap.add_argument("--lang", type=str, default="ru", help="Язык")
+    ap.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Модель HF")
+    ap.add_argument("--show_table", action="store_true", help="Вывести результаты в терминал в формате 'Тема ----- Результат'")
     args = ap.parse_args()
 
-    text = read_text(Path(args.infile))
-    keywords_list = keywords(text, lang=args.lang, keywords_num=args.num_keywords)
-    if not keywords_list:
-        raise SystemExit("Не удалось извлечь ключевые слова — проверьте входной текст.")
-
-    base_prompt = build_prompt(keywords_list, lang=args.lang)
-
-    title = ""
-    missed = keywords_list[:]
-    cov = 0.0
-
-    for attempt in range(1, REPEAT_TRIES + 1):
-        # Первая/очередная генерация
-        title = summarize_title(
-            body_text=text,
-            prompt=base_prompt if attempt == 1 else (
-                build_prompt(keywords_list, lang=args.lang)
-                + " Используй каждое слово дословно. Не используй скобки и не ставь все слова в конец."
-            ),
-            model_name=args.model,
-            min_len=args.min_len,
-            max_len=args.max_len,
+    print(f"Загрузка модели {args.model}...")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, 
+            torch_dtype="auto", 
+            device_map="auto"
         )
-        cov, missed = coverage_score(title, keywords_list)
+    except Exception as e:
+        print(f"Ошибка загрузки модели: {e}")
+        return
 
-        # если модель всё-таки вывела скобки — вычистим и проверим ещё раз
-        cleaned = postprocess_title(title)
-        if cleaned != title:
-            title = cleaned
-            cov, missed = coverage_score(title, keywords_list)
+    infile = Path(args.infile)
+    topics = read_topics(infile)
+    if not topics:
+        print(f"Файл {infile} пуст или не найден.")
+        return
+        
+    print(f"Найдено тем для обработки: {len(topics)}")
+    
+    results = []
 
-        if cov >= args.min_coverage and not re.search(r"[\(\[\{].*[\)\]\}]$", title):
-            break
+    for idx, topic in enumerate(topics, 1):
+        print(f"Processing {idx}/{len(topics)}...") 
+        
+        kws = extract_keywords_from_title(topic, lang=args.lang, keywords_num=3)
+        
+        messages = build_prompt(topic, kws, lang=args.lang)
+        best_desc = ""
+        best_cov = -1.0
+        
+        for attempt in range(1, REPEAT_TRIES + 1):
+            description = generate_description(model, tokenizer, messages)
+            cov, missed = coverage_score(description, kws)
+            
+            if cov > best_cov:
+                best_cov = cov
+                best_desc = description
 
-    # Если всё ещё ниже порога — встроим недостающие слова
-    if cov < args.min_coverage or re.search(r"[\(\[\{].*[\)\]\}]$", title):
-        title = integrate_missing_inline(title, missed, keywords_list, lang=args.lang)
-        cov, missed = coverage_score(title, keywords_list)
+            if cov >= 0.99:
+                break
+            else:
+                missing_str = ", ".join(missed)
+                messages.append({"role": "assistant", "content": description})
+                messages.append({"role": "user", "content": f"Перепиши описание, чтобы обязательно добавить слова: {missing_str}. Сохрани длину НЕ БОЛЕЕ {MAX_WORDS_LIMIT} слов."})
 
-    # ====== Вывод ======
-    print("\n=== ключевые слова ===")
-    print(", ".join(keywords_list))
-    print("\n=== промпт ===")
-    print(base_prompt)
-    print("\n=== заголовок ===")
-    print(title)
-    print("\n=== метрика ===")
-    used = len(keywords_list) - len(missed)
-    total = len(keywords_list)
-    print(f"покрытие ключевых слов: {used}/{total} = {used / total:.0%}")
-    if missed:
-        print("не использованы:", ", ".join(missed))
-    else:
-        print("все ключевыые слова учтены.")
+        final_desc = best_desc
 
+        cov, missed = coverage_score(final_desc, kws)
+        if len(missed) > 0:
+            final_desc += f" (Ключевые слова: {', '.join(missed)})"
+        
+        print(f"  -> Исходная длина: {len(final_desc.split())} слов.")
+        print(f"  -> Ключевые слова: {kws}.")
+        final_desc = enforce_length_limit(model, tokenizer, final_desc, MAX_WORDS_LIMIT, REPEAT_TRIES)
+                
+        word_count = len(final_desc.split())
+        is_length_ok = word_count <= MAX_WORDS_LIMIT
+        
+        cov, missed = coverage_score(final_desc, kws)
+        kw_ok = len(missed) == 0
+
+        metric_status = ""
+        metric_status += f"длина ≤ {MAX_WORDS_LIMIT} слов ({'OK' if is_length_ok else f'НЕ OK, {word_count} слов'})"
+        metric_status += ", ключевые слова "
+        metric_status += "есть" if kw_ok else f"отсутствуют ({len(missed)} шт.)"
+        
+        
+        results.append({
+            "slide_title": topic,
+            "content": final_desc,
+            "metric": metric_status
+        })
+        print(f"  -> {final_desc}")
+        print(f"  -> Метрика: {metric_status}")
+
+    df = pd.DataFrame(results)
+    outfile = Path(args.outfile)
+    df.to_csv(outfile, index=False, encoding="utf-8")
+    print(f"\nДанные сохранены в файл: {outfile}")
+
+    if args.show_table:
+        print("\n" + "="*80)
+        print("ИТОГОВЫЕ РЕЗУЛЬТАТЫ")
+        print("="*80)
+        for item in results:
+            print(f"{item['slide_title']}\n----- {item['content']}")
+            print(f"Метрика: {item['metric']}")
+            print("-" * 50)
+        print("="*80 + "\n")
 
 if __name__ == "__main__":
     main()
